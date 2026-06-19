@@ -1,0 +1,264 @@
+# =============================================================================
+# Embedded Debug Auto-Tuning Configuration
+# =============================================================================
+# This file defines the entire closed-loop workflow:
+#   flash → monitor → analyze → adjust → repeat
+#
+# All paths are relative to the project root unless absolute.
+
+# ---------------------------------------------------------------------------
+# Project identity
+# ---------------------------------------------------------------------------
+project:
+  name: "my_project"
+  root: "."                        # project root (where Makefile/CMakeLists.txt lives)
+
+# ---------------------------------------------------------------------------
+# Build & flash
+# ---------------------------------------------------------------------------
+build:
+  system: make                     # make | cmake | custom
+  target: all                      # build target
+  binary: "build/firmware.bin"     # path to flashable binary (elf/bin/hex)
+  flags: "-j$(nproc)"              # extra build flags
+  clean_first: false               # run 'clean' before every build
+
+flash:
+  backend: openocd                 # openocd | jlink | stlink | dfu | custom
+  # ---- OpenOCD ----
+  openocd:
+    interface: "interface/stlink-v2.cfg"
+    target: "target/stm32f4x.cfg"
+    transport: "hla"               # hla (stlink) | jtag | swd
+    extra_args: "-c 'adapter speed 4000'"
+  # ---- J-Link ----
+  jlink:
+    device: "STM32F407VG"
+    interface: "SWD"
+    speed: 4000
+  # ---- ST-Link (st-flash) ----
+  stlink: {}
+  # ---- dfu-util ----
+  dfu:
+    vid: "0483"
+    pid: "df11"
+    alt: 0
+  # ---- Verify after flash ----
+  verify: true                     # readback + compare after flashing
+  verify_retries: 3
+  # ---- Boot wait ----
+  boot_timeout_ms: 5000            # max wait for BOOT_DONE frame
+  reset_command: "reset halt"      # OpenOCD command to reset after flash
+
+# ---------------------------------------------------------------------------
+# Serial monitor
+# ---------------------------------------------------------------------------
+serial:
+  port: "/dev/ttyUSB0"             # or /dev/ttyACM0, COM3, etc.
+  baudrate: 115200
+  data_bits: 8
+  stop_bits: 1
+  parity: "N"                      # N | E | O
+  flow_control: false
+  timeout_ms: 2000                 # read timeout
+
+# ---------------------------------------------------------------------------
+# Frame protocol (MUST match firmware tracepoint.h)
+# ---------------------------------------------------------------------------
+protocol:
+  sync_byte_1: 0xAA
+  sync_byte_2: 0x55
+  max_payload_bytes: 256           # max frame size including header/crc
+  crc_poly: 0x07                   # CRC-8-ATM polynomial
+
+# ---------------------------------------------------------------------------
+# Monitor session
+# ---------------------------------------------------------------------------
+monitor:
+  duration_ms: 5000                # how long to collect data each round
+  warmup_ms: 500                   # discard data for this long after BOOT_DONE
+  csv_dir: "tools/logs"            # where to write per-round CSV files
+  frame_error_threshold: 0.05      # abort if frame error rate exceeds 5%
+
+# ---------------------------------------------------------------------------
+# Loop control
+# ---------------------------------------------------------------------------
+loop:
+  # UNVERIFIED: convergence_rounds=3 and stall_rounds=5 are placeholder defaults.
+  # Tune based on the system's dominant time constant and noise characteristics.
+  # Fast-responding systems may need only 2 rounds; high-inertia systems may need 10+.
+  max_rounds: 20                   # maximum flash→monitor→adjust cycles
+  convergence_rounds: 3            # rounds within tolerance to declare success
+  stall_rounds: 5                  # rounds without improvement → give up
+  cooldown_ms: 1000                # delay between flash and monitor start
+
+# ---------------------------------------------------------------------------
+# Safety bounds (global — applied every round)
+# ---------------------------------------------------------------------------
+safety:
+  # If ANY variable exceeds its emergency bound, stop immediately.
+  # The agent MUST NOT proceed to the next round.
+  emergency_action: "stop"         # stop | warn
+
+# ---------------------------------------------------------------------------
+# Monitor variables
+# ---------------------------------------------------------------------------
+# Each variable has:
+#   id:        unique 16-bit ID (matches TRACEPOINT_ID_* in firmware)
+#   name:      human-readable label
+#   type:      int32 | uint32 | float | uint16 | int16
+#   unit:      display unit (no conversion, just for logs)
+#   expected:  {min, max} — the "good" range (success criterion)
+#   warn:      {min, max} — warn if outside this range
+#   emergency: {min, max} — abort loop immediately if outside
+#   window_ms: rolling window for statistics (0 = use monitor.duration_ms)
+#
+variables:
+  - id: 0x1001
+    name: "motor_rpm"
+    type: float
+    unit: "rpm"
+    expected:  { min: 1180.0, max: 1220.0 }
+    warn:      { min: 1100.0, max: 1300.0 }
+    emergency: { min: 0.0,    max: 2000.0 }
+
+  - id: 0x1002
+    name: "bus_voltage"
+    type: float
+    unit: "V"
+    expected:  { min: 11.5, max: 12.5 }
+    warn:      { min: 10.5, max: 13.5 }
+    emergency: { min: 9.0,  max: 15.0 }
+
+  - id: 0x1003
+    name: "cpu_temp"
+    type: float
+    unit: "°C"
+    expected:  { min: 30.0, max: 55.0 }
+    warn:      { min: 20.0, max: 65.0 }
+    emergency: { min: 0.0,  max: 85.0 }
+
+  - id: 0x1004
+    name: "control_error"
+    type: float
+    unit: ""
+    expected:  { min: -0.05, max: 0.05 }
+    warn:      { min: -0.15, max: 0.15 }
+    emergency: { min: -1.0,  max: 1.0 }
+
+# ---------------------------------------------------------------------------
+# Adjustable parameters
+# ---------------------------------------------------------------------------
+# Defines what the agent can tune and HOW.
+#   file:       source/header file to edit (relative to project root)
+#   pattern:    regex to locate the line (must capture the numeric value)
+#   type:       macro | kconfig | json | struct_field
+#   format:     "%.2f" etc. — printf format for writing the value back
+#   range:      absolute min/max the parameter may take
+#   default:    factory value (for rollback)
+#   step:       default adjustment step size
+#   auto:       true = agent may change this; false = requires human
+#   depends_on: list of variable IDs that influence this parameter's tuning
+#
+# UNVERIFIED: The depends_on relationship assumes monotonic negative correlation
+# between parameter and variable.  Non-monotonic systems (e.g., PWM freq vs
+# efficiency with resonant peaks) need a per-parameter direction map.
+# UNVERIFIED: step values (0.1, 0.05, 0.01) are arbitrary.  Calibrate based
+# on the system's sensitivity (∂var/∂param).
+#
+parameters:
+  - name: "PID_Kp"
+    file: "include/pid_config.h"
+    pattern: '#define\s+PID_KP\s+([0-9.]+)f?'
+    type: macro
+    format: "%.4f"
+    range:   { min: 0.001, max: 10.0 }
+    default: 0.5
+    step:    0.1
+    auto:    true
+    depends_on: [0x1004]
+
+  - name: "PID_Ki"
+    file: "include/pid_config.h"
+    pattern: '#define\s+PID_KI\s+([0-9.]+)f?'
+    type: macro
+    format: "%.4f"
+    range:   { min: 0.0, max: 5.0 }
+    default: 0.1
+    step:    0.05
+    auto:    true
+    depends_on: [0x1004]
+
+  - name: "PID_Kd"
+    file: "include/pid_config.h"
+    pattern: '#define\s+PID_KD\s+([0-9.]+)f?'
+    type: macro
+    format: "%.4f"
+    range:   { min: 0.0, max: 2.0 }
+    default: 0.02
+    step:    0.01
+    auto:    true
+    depends_on: [0x1004]
+
+  - name: "PWM_FREQ"
+    file: "include/pwm_config.h"
+    pattern: '#define\s+PWM_FREQUENCY\s+(\d+)'
+    type: macro
+    format: "%d"
+    range:   { min: 1000, max: 50000 }
+    default: 20000
+    step:    1000
+    auto:    false               # changing PWM freq may need HW revalidation
+    depends_on: [0x1001]
+
+# =============================================================================
+# Extension points (reserved for future backends — parsed but not yet used)
+# =============================================================================
+extensions:
+  monitor_backend: "serial"       # reserved: rtt | swo | can | tcp
+  analyzer: "deviation"           # reserved: threshold | trend | fft | ml
+  adjuster: "macro"               # reserved: kconfig | json | eeprom | cli
+  decision_sink: "file"           # reserved: mqtt | webhook | sqlite
+
+# =============================================================================
+# Scenario B example: Stage diagnostics (commented out — uncomment to use)
+# =============================================================================
+# This configuration diagnoses an SD card firmware-burn sequence.
+# Each stage sets its flag variable to 0 on success, 1 on failure.
+# With no auto:true parameters, loop_runner.sh auto-detects Scenario B
+# and runs a single flash→monitor→analyze→report cycle.
+#
+# variables:
+#   - id: 0x2001
+#     name: "stage_bootloader_init"
+#     type: uint16
+#     unit: "flag"
+#     expected: { min: 0, max: 0 }
+#     warn:     { min: 1, max: 1 }
+#     emergency:{ min: 0, max: 1 }
+#
+#   - id: 0x2002
+#     name: "stage_partition_table"
+#     type: uint16
+#     unit: "flag"
+#     expected: { min: 0, max: 0 }
+#     warn:     { min: 1, max: 1 }
+#     emergency:{ min: 0, max: 1 }
+#
+#   - id: 0x2003
+#     name: "stage_firmware_write"
+#     type: uint16
+#     unit: "flag"
+#     expected: { min: 0, max: 0 }
+#     warn:     { min: 1, max: 1 }
+#     emergency:{ min: 0, max: 1 }
+#
+#   - id: 0x2004
+#     name: "stage_checksum_verify"
+#     type: uint16
+#     unit: "flag"
+#     expected: { min: 0, max: 0 }
+#     warn:     { min: 1, max: 1 }
+#     emergency:{ min: 0, max: 1 }
+#
+# parameters: []   # no auto-tune params → Scenario B automatically
