@@ -6,7 +6,7 @@ Checks config integrity, toolchain availability, file paths, serial port
 access, and protocol consistency between config.yaml and tracepoint.h.
 
 Exit 0: all checks passed (warnings are non-fatal)
-Exit 1: errors found — fix before running loop_runner.sh
+Exit 1: errors found — fix before running loop_runner.py
 """
 
 import argparse
@@ -23,20 +23,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 class Checker:
-    def __init__(self):
+    def __init__(self, config_dir: Path | None = None):
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        self._config_dir = config_dir
 
     def error(self, msg: str):
         self.errors.append(f"  ERROR: {msg}")
 
     def warn(self, msg: str):
         self.warnings.append(f"  WARN:  {msg}")
+
+    def _resolve_root(self, cfg: dict) -> Path:
+        """Resolve project.root relative to the config file directory."""
+        root_str = cfg.get("project", {}).get("root", ".")
+        if self._config_dir:
+            return (self._config_dir / root_str).resolve()
+        return Path(root_str).resolve()
 
     def check_config_exists(self, path: str):
         if not Path(path).exists():
@@ -76,22 +84,41 @@ class Checker:
     def check_toolchain(self, cfg: dict):
         build_system = cfg.get("build", {}).get("system", "")
         if build_system == "make":
-            if not shutil.which("make"):
-                self.error("make not found in PATH")
+            explicit = cfg.get("build", {}).get("make_executable")
+            if explicit:
+                if not Path(explicit).exists():
+                    self.error(f"make executable not found at configured path: {explicit}")
+            elif not (shutil.which("make") or shutil.which("mingw32-make.exe")):
+                self.error("make not found in PATH (checked: make, mingw32-make.exe)")
         elif build_system == "cmake":
-            if not shutil.which("cmake"):
+            explicit = cfg.get("build", {}).get("cmake_executable")
+            if explicit:
+                if not Path(explicit).exists():
+                    self.error(f"cmake executable not found at configured path: {explicit}")
+            elif not shutil.which("cmake"):
                 self.error("cmake not found in PATH")
 
         backend = cfg.get("flash", {}).get("backend", "")
+        backend_cfg = cfg.get("flash", {}).get(backend, {})
+        explicit = backend_cfg.get("executable") if backend_cfg else None
         tool_map = {
-            "openocd": "openocd",
-            "jlink": "JLinkExe",
-            "stlink": "st-flash",
-            "dfu": "dfu-util",
+            "openocd": ("openocd", None),
+            "jlink": ("JLinkExe", "JLink.exe"),
+            "stlink": ("st-flash", None),
+            "dfu": ("dfu-util", None),
         }
-        tool = tool_map.get(backend, "")
-        if tool and not shutil.which(tool):
-            self.error(f"Flash backend '{backend}' requires '{tool}' in PATH")
+        entry = tool_map.get(backend)
+        if explicit:
+            if not Path(explicit).exists():
+                self.error(
+                    f"Flash backend '{backend}' executable not found "
+                    f"at configured path: {explicit}"
+                )
+        elif entry and backend != "custom":
+            primary, alt = entry
+            if not (shutil.which(primary) or (alt and shutil.which(alt))):
+                names = f"'{primary}'" if not alt else f"'{primary}' / '{alt}'"
+                self.error(f"Flash backend '{backend}' requires {names} in PATH")
 
     def check_python_deps(self):
         for mod in ["serial", "yaml"]:
@@ -101,20 +128,31 @@ class Checker:
                 self.error(f"Python module '{mod}' not installed (pip install pyserial pyyaml)")
 
     def check_project_root(self, cfg: dict):
-        root = Path(cfg.get("project", {}).get("root", "."))
+        root = self._resolve_root(cfg)
         if not root.exists():
             self.error(f"Project root not found: {root}")
 
     def check_parameter_files(self, cfg: dict):
-        root = Path(cfg.get("project", {}).get("root", "."))
+        root = self._resolve_root(cfg)
         for p in cfg.get("parameters", []):
             fpath = root / p["file"]
             if not fpath.exists():
                 self.warn(f"Parameter file not found: {fpath}")
                 continue
-            content = fpath.read_text()
+            content = fpath.read_text(encoding="utf-8")
             if not re.search(p["pattern"], content):
                 self.warn(f"Pattern for '{p['name']}' matches nothing in {fpath}")
+
+    def check_bin_address(self, cfg: dict):
+        binary = Path(cfg["build"]["binary"])
+        if binary.suffix.lower() != ".bin":
+            return
+        backend = cfg["flash"]["backend"]
+        if backend not in {"openocd", "jlink", "stlink"}:
+            return
+        addr = cfg["flash"].get(backend, {}).get("address")
+        if not addr:
+            self.error(f"BIN image requires flash.{backend}.address")
 
     def check_serial_port(self, cfg: dict):
         port = cfg.get("serial", {}).get("port", "")
@@ -139,7 +177,7 @@ class Checker:
         if not tp_header.exists():
             self.warn(f"tracepoint.h not found at {tp_header} — skipping consistency check")
             return
-        content = tp_header.read_text()
+        content = tp_header.read_text(encoding="utf-8")
 
         sync1 = proto.get("sync_byte_1", 0xAA)
         sync2 = proto.get("sync_byte_2", 0x55)
@@ -170,16 +208,17 @@ def main():
     ap.add_argument("--config", default="tools/config.yaml")
     args = ap.parse_args()
 
-    ck = Checker()
+    config_path = Path(args.config).resolve()
+    ck = Checker(config_dir=config_path.parent)
 
     print("[validate] Checking...")
 
     # 1. Config file integrity
-    if not ck.check_config_exists(args.config):
+    if not ck.check_config_exists(str(config_path)):
         print("\n".join(ck.errors))
         sys.exit(1)
 
-    cfg = load_config(args.config)
+    cfg = load_config(str(config_path))
 
     # 2. Variable IDs
     ck.check_variable_ids_unique(cfg)
@@ -202,10 +241,13 @@ def main():
     # 8. Parameter files
     ck.check_parameter_files(cfg)
 
-    # 9. Serial port (best-effort)
+    # 9. BIN address requirement
+    ck.check_bin_address(cfg)
+
+    # 10. Serial port (best-effort)
     ck.check_serial_port(cfg)
 
-    # 10. Protocol consistency
+    # 11. Protocol consistency
     ck.check_protocol_consistency(cfg)
 
     # Report
@@ -214,7 +256,7 @@ def main():
 
     if ck.errors:
         print("\n".join(ck.errors))
-        print(f"\n[validate] {len(ck.errors)} error(s) found. Fix before running loop_runner.sh.")
+        print(f"\n[validate] {len(ck.errors)} error(s) found. Fix before running loop_runner.py.")
         sys.exit(1)
 
     print("[validate] OK — all checks passed")

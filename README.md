@@ -32,8 +32,11 @@
 ### 2.1 环境准备
 
 ```bash
-# 安装 Python 依赖
+# 安装 Python 依赖 (Python 3.10+)
 pip install pyserial pyyaml
+
+# 开发依赖 (仅测试)
+pip install pytest
 
 # 确认烧录工具链在 PATH 中 (以 OpenOCD 为例)
 which openocd
@@ -84,7 +87,7 @@ void main(void) {
 python3 tools/validate.py --config tools/config.yaml
 
 # Step 1: 编译并烧录
-bash tools/flash.sh --config tools/config.yaml
+python3 tools/flash.py --config tools/config.yaml
 
 # Step 2: 单次监控采集 (打印到终端)
 python3 tools/monitor.py --config tools/config.yaml --once
@@ -100,10 +103,10 @@ python3 tools/adjust.py --config tools/config.yaml --round 1
 
 ```bash
 # 一键启动闭环 (根据配置自动检测场景 A/B/C)
-bash tools/loop_runner.sh --config tools/config.yaml
+python3 tools/loop_runner.py --config tools/config.yaml
 
 # 限制最大轮数
-bash tools/loop_runner.sh --config tools/config.yaml --max-rounds 10
+python3 tools/loop_runner.py --config tools/config.yaml --max-rounds 10
 ```
 
 ---
@@ -158,20 +161,30 @@ tools/
 ├── config.yaml                  # 总配置文件 (含 UNVERIFIED 标记注释)
 ├── validate.py                  # 前置校验：配置完整性、工具链、串口、文件路径
 ├── simulate.py                  # 离线回放：用历史 CSV 测试 analyze -> adjust 链路
-├── flash.sh                     # 编译 -> 烧录 -> 读回校验 -> 等待 BOOT_DONE
+├── flash.py                     # 编译 -> 烧录 -> 读回校验 -> 等待 BOOT_DONE (跨平台)
 ├── monitor.py                   # 串口帧捕获 -> CSV 时序日志
 ├── analyze.py                   # 偏差分析 -> 收敛/发散/停滞判定 -> 决策 JSON
 ├── adjust.py                    # 根据决策修改源码 (生成 diff、回滚、dry-run)
-├── loop_runner.sh               # 顶层循环编排器 (自动检测场景 A/B/C)
+├── loop_runner.py               # 顶层循环编排器 (自动检测场景 A/B/C, 跨平台)
 ├── firmware/
 │   └── tracepoint.h             # 嵌入式端追踪桩头文件 (零分配、ISR 安全)
-└── lib/
-    ├── __init__.py              # 包初始化
-    ├── protocol.py              # 二进制帧协议解析器 (双端一致)
-    ├── backends.py              # 监控/烧录后端抽象接口 + SerialBackend + FileBackend
-    ├── analyzers.py             # 分析策略插件 (DeviationAnalyzer + ThresholdAnalyzer)
-    ├── adjusters.py             # 参数修改插件 (MacroAdjuster)
-    └── sinks.py                 # 决策输出插件 (FileSink)
+├── lib/
+│   ├── __init__.py              # 包初始化
+│   ├── commands.py              # CommandResult + CommandRunner 共享执行原语
+│   ├── builders.py              # BuildRunner ABC + Make/CMake/Custom 构建器
+│   ├── protocol.py              # 二进制帧协议解析器 (双端一致)
+│   ├── backends.py              # MonitorBackend + FlashBackend ABC + 5 个烧录后端
+│   ├── analyzers.py             # 分析策略插件 (DeviationAnalyzer + ThresholdAnalyzer)
+│   ├── adjusters.py             # 参数修改插件 (MacroAdjuster)
+│   └── sinks.py                 # 决策输出插件 (FileSink)
+└── tests/
+    ├── test_commands.py         # CommandRunner 超时/日志/cwd/shell=False
+    ├── test_builders.py         # Make/CMake/Custom 命令构造
+    ├── test_backends.py         # 5 个后端工厂/命令构造/能力声明/J-Link 路径
+    ├── test_flash.py            # verify_flash 逻辑/退出码映射
+    ├── test_loop.py             # 场景检测/StepError/退出码
+    ├── test_monitor.py          # --require-boot-done 签名
+    └── test_validate.py         # BIN 地址检查/custom 后端
 ```
 
 ### 运行时日志目录
@@ -207,23 +220,46 @@ tools/logs/
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `system` | string | 构建系统: `make` \| `cmake` \| `custom` |
-| `target` | string | 构建目标 |
+| `directory` | string | 构建输出目录 (默认 `build`) |
+| `parallel` | int | 并行任务数: make 转换为 `-jN`, cmake 转换为 `--parallel N` |
+| `flags` | list | 额外构建参数 (数组，无 shell 展开) |
+| `target` | string | 构建目标 (默认 `all`) |
 | `binary` | path | 烧录镜像路径 (elf/bin/hex) |
-| `flags` | string | 额外构建参数 |
 | `clean_first` | bool | 每次构建前执行 clean |
 
 ### `flash`
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `backend` | string | 烧录后端: `openocd` \| `jlink` \| `stlink` \| `dfu` |
-| `openocd.interface` | path | OpenOCD 调试器配置文件 |
-| `openocd.target` | path | OpenOCD 目标芯片配置文件 |
-| `jlink.device` | string | J-Link 设备名 (如 `STM32F407VG`) |
-| `dfu.vid` / `dfu.pid` | hex | DFU 模式下的 USB VID/PID |
-| `verify` | bool | 烧录后读回校验 |
-| `verify_retries` | int | 读回校验重试次数 |
+| `backend` | string | 烧录后端: `openocd` \| `jlink` \| `stlink` \| `dfu` \| `custom` |
+| `verify` | bool | 启用校验 (INLINE 或 SEPARATE 模式) |
+| `allow_unverified` | bool | NONE 校验模式时是否允许继续 |
+| `allow_no_reset` | bool | NONE 复位模式时是否允许继续 |
 | `boot_timeout_ms` | int | 等待 BOOT_DONE 帧的最大时间 |
+| `openocd.executable` | path/null | OpenOCD 可执行文件 (null = 自动查找 PATH) |
+| `openocd.interface` | path | 调试器接口配置文件 |
+| `openocd.target` | path | 目标芯片配置文件 |
+| `openocd.address` | string | BIN 镜像的加载地址 (ELF/HEX 不需要) |
+| `openocd.extra_args` | list | 额外参数数组 (如 `["-c", "adapter speed 4000"]`) |
+| `jlink.executable` | path/null | J-Link 可执行文件 (Windows 自动尝试 `JLink.exe`) |
+| `jlink.device` | string | 设备名 (如 `STM32F407VG`) |
+| `jlink.interface` | string | 接口协议: `SWD` \| `JTAG` |
+| `jlink.speed` | int | 接口速度 (kHz) |
+| `jlink.address` | string | BIN 镜像加载地址 |
+| `stlink.executable` | path/null | st-flash 可执行文件 |
+| `stlink.address` | string | 镜像加载地址 |
+| `dfu.executable` | path/null | dfu-util 可执行文件 |
+| `dfu.vid` / `dfu.pid` | hex | USB VID/PID |
+| `dfu.alt` | int | DFU alternate setting |
+| `custom.flash_command` | list | 自定义烧录命令数组 (支持 `{binary}`, `{project_root}` 占位符) |
+
+验证模式 (由各后端类属性声明):
+
+| 模式 | 含义 | 后端 |
+|------|------|------|
+| INLINE | 烧录命令自带校验 | OpenOCD, J-Link |
+| SEPARATE | 独立读回比较 | ST-Link (`st-flash verify`) |
+| NONE | 无法校验 | DFU, Custom |
 
 ### `serial`
 
@@ -330,12 +366,12 @@ parameters: []   # 无 auto 参数 -> 自动识别为场景 B
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      loop_runner.sh                         │
+│                      loop_runner.py                         │
 │                                                             │
 │  Step 0: validate  ──> python3 tools/validate.py            │
 │       │                                                    │
 │       ▼                                                    │
-│  Step 1: flash     ──> bash tools/flash.sh                  │
+│  Step 1: flash     ──> python3 tools/flash.py                  │
 │       │              (build -> flash -> verify -> BOOT_DONE)│
 │       ▼                                                    │
 │  Step 2: monitor   ──> python3 tools/monitor.py            │
@@ -358,14 +394,14 @@ parameters: []   # 无 auto 参数 -> 自动识别为场景 B
 | 步骤 | 命令 | 输入 | 输出 | 失败处理 |
 |------|------|------|------|---------|
 | **0. validate** | `validate.py` | `config.yaml` | 通过/错误列表 | 有 ERROR 则终止 |
-| **1. flash** | `flash.sh` | 源码 + 工具链 | 烧录好的固件 | 按错误码分类重试或终止 |
+| **1. flash** | `flash.py` | 源码 + 工具链 | 烧录好的固件 | 按错误码分类重试或终止 |
 | **2. monitor** | `monitor.py` | 串口帧数据 | `monitor_r{N}.csv` | 终止 |
 | **3. analyze** | `analyze.py` | CSV + 历史 | `decision_r{N}.json` | 终止 |
 | **4. adjust** | `adjust.py` | 决策 JSON + 源码 | 修改后的源文件 + diff | 继续下一轮 |
 
 ### 6.3 场景自动检测逻辑
 
-`loop_runner.sh` 启动时自动判断：
+`loop_runner.py` 启动时自动判断：
 
 ```
 config.yaml 中有 auto:true 的 parameters?
@@ -548,13 +584,17 @@ python3 tools/adjust.py --config tools/config.yaml --rollback --round 1
 
 ### 9.2 烧录后端 (`lib/backends.py` — FlashBackend)
 
-抽象构建+烧录+校验流程。当前通过 `flash.sh` 子进程调用。
+抽象烧录+校验+复位流程 (ABC 接口)，通过 `CommandRunner` 执行外部 CLI 工具。`create_flash_backend()` 工厂根据 `config.yaml` 自动选择具体后端。
 
-已注册的 CLI 后端：
-- OpenOCDBackend
-- JLinkBackend
-- STLinkBackend
-- DFUBackend
+已实现的 5 个后端：
+
+| 后端类 | CLI 工具 | 校验模式 | 复位模式 |
+|--------|---------|---------|---------|
+| `OpenOCDBackend` | openocd | INLINE | INLINE |
+| `JLinkBackend` | JLinkExe / JLink.exe | INLINE | INLINE |
+| `STLinkBackend` | st-flash | SEPARATE | SUPPORTED |
+| `DFUBackend` | dfu-util | NONE | NONE |
+| `CustomFlashBackend` | 用户定义 | NONE | NONE |
 
 预留后端：
 - `CMSISDAPBackend` — pyOCD
@@ -627,11 +667,23 @@ extensions:
 
 ## 11. 版本
 
-**v0.1.0** — 初始模板版本。
+**v0.2.0** — Bash→Python 跨平台迁移。
 
-- 所有核心流水线 (validate / flash / monitor / analyze / adjust) 均可运行
-- 三类场景 (A/B/C) 通过配置自动检测
-- 5 个扩展接口已定义，最小可用实现就位
-- 所有 UNVERIFIED 标记统一使用 `UNVERIFIED:` 前缀，可通过 `grep` 检索
+变更摘要 (相对 v0.1.0):
 
-该版本为框架模板，目前等待在实际项目中打磨：已经完成校调阈值、验证硬件平台、实现预留后端。
+- `flash.sh` → `flash.py`：构建+烧录+校验+复位+启动等待，Windows/Linux/macOS 三平台
+- `loop_runner.sh` → `loop_runner.py`：场景自动检测 + 闭环编排 + 异常/超时映射
+- 新增 `lib/commands.py`：CommandResult + CommandRunner 共享执行原语 (可注入，可测试)
+- 新增 `lib/builders.py`：Make/CMake/Custom 构建器，命令构造与执行分离
+- 重构 `lib/backends.py`：FlashBackend ABC + 5 个后端 (OpenOCD/JLink/STLink/DFU/Custom) + FlashContext
+- `config.yaml` 迁移：`build.flags` 数组化、`parallel` 替代 `$(nproc)`、BIN 地址配置、flash 段新增 `allow_unverified`/`allow_no_reset`
+- `monitor.py`：新增 `--require-boot-done` 参数，`monitor_to_csv()` 签名参数化
+- `validate.py`：新增 BIN 地址检查、`custom` 后端支持
+- 新增 7 个测试文件，44 个测试用例
+- Python 最低版本要求：3.10+
+
+保留不变 (v0.1.0):
+
+- 三类场景 (A/B/C) 自动检测
+- `UNVERIFIED:` 前缀标记 (共 10 处)，可通过 `grep -r "UNVERIFIED" tools/` 检索
+- 5 个扩展接口 (MonitorBackend / FlashBackend / Analyzer / Adjuster / DecisionSink)

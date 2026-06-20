@@ -41,7 +41,7 @@ class MacroAdjuster(Adjuster):
         file_path = project_root / param_config["file"]
         if not file_path.exists():
             return None
-        content = file_path.read_text()
+        content = file_path.read_text(encoding="utf-8")
         match = re.search(param_config["pattern"], content)
         if not match:
             return None
@@ -58,7 +58,7 @@ class MacroAdjuster(Adjuster):
         if not file_path.exists():
             return False, f"File not found: {file_path}"
 
-        content = file_path.read_text()
+        content = file_path.read_text(encoding="utf-8")
         match = re.search(pattern, content)
         if not match:
             return False, f"Pattern not found in {file_path}"

@@ -39,12 +39,12 @@ from lib.adjusters import MacroAdjuster
 # Helpers
 # ---------------------------------------------------------------------------
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def load_decision(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -66,7 +66,7 @@ def rollback_round(round_num: int) -> bool:
         return False
 
     restored = 0
-    log_content = log_path.read_text()
+    log_content = log_path.read_text(encoding="utf-8")
 
     # Parse log to find modified files
     for line in log_content.splitlines():

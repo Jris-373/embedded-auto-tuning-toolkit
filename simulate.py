@@ -31,7 +31,7 @@ from lib.analyzers import DeviationAnalyzer, ThresholdAnalyzer
 
 def load_csv(path: str) -> Dict[int, List[float]]:
     data: Dict[int, List[float]] = defaultdict(list)
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -46,7 +46,7 @@ def load_csv(path: str) -> Dict[int, List[float]]:
 def replay_single(csv_path: str, config_path: str, analyzer_type: str = "deviation"):
     """Replay a single CSV and print the decision."""
     import yaml
-    cfg = yaml.safe_load(open(config_path))
+    cfg = yaml.safe_load(open(config_path, encoding="utf-8"))
     var_configs = {v["id"]: v for v in cfg.get("variables", [])}
 
     data = load_csv(csv_path)
@@ -80,7 +80,7 @@ def replay_all(config_path: str):
         return
 
     import yaml
-    cfg = yaml.safe_load(open(config_path))
+    cfg = yaml.safe_load(open(config_path, encoding="utf-8"))
     var_configs = {v["id"]: v for v in cfg.get("variables", [])}
 
     # Determine analyzer: threshold if no auto:true params

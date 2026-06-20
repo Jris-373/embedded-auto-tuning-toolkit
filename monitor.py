@@ -32,7 +32,7 @@ from lib.protocol import FrameParser, ParsedFrame, SpecialFrame
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -100,10 +100,13 @@ def monitor_once(cfg: dict, var_index: Dict[int, dict]) -> None:
     print(f"\nFrames: {parser.good_frames} good  {parser.bad_crc_frames} bad  ({parser.error_rate*100:.1f}% error rate)")
 
 
-def monitor_to_csv(cfg: dict, var_index: Dict[int, dict], round_num: int) -> str:
+def monitor_to_csv(cfg: dict, var_index: Dict[int, dict], round_num: int,
+                   require_boot_done: bool = False) -> str:
     """
     Capture monitoring data to a CSV file.
     Returns the path to the CSV file.
+
+    If *require_boot_done* is True, exit 4 when BOOT_DONE is not received.
     """
     monitor_cfg = cfg["monitor"]
     duration_s = monitor_cfg["duration_ms"] / 1000.0
@@ -139,7 +142,12 @@ def monitor_to_csv(cfg: dict, var_index: Dict[int, dict], round_num: int) -> str
                 break
 
         if not boot_done_seen:
-            print("[monitor] WARNING: BOOT_DONE not received, capturing anyway", file=sys.stderr)
+            if require_boot_done:
+                print("[monitor] BOOT_DONE not received", file=sys.stderr)
+                sys.exit(4)
+            else:
+                print("[monitor] WARNING: BOOT_DONE not received, capturing anyway",
+                      file=sys.stderr)
 
         # --- Warmup ---
         warmup_deadline = time.monotonic() + warmup_s
@@ -210,6 +218,8 @@ def main():
     parser.add_argument("--round", type=int, default=1, help="Round number (for CSV naming)")
     parser.add_argument("--once", action="store_true", help="Capture once and print to stdout")
     parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
+    parser.add_argument("--require-boot-done", action="store_true",
+                        help="Exit non-zero if BOOT_DONE not received")
     args = parser.parse_args()
 
     if args.list_ports:
@@ -222,7 +232,8 @@ def main():
     if args.once:
         monitor_once(cfg, var_index)
     else:
-        csv_path = monitor_to_csv(cfg, var_index, args.round)
+        csv_path = monitor_to_csv(cfg, var_index, args.round,
+                               require_boot_done=args.require_boot_done)
         print(f"CSV: {csv_path}")
 
 

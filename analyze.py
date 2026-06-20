@@ -67,7 +67,7 @@ class Decision:
 # Core analysis
 # ---------------------------------------------------------------------------
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -75,7 +75,7 @@ def load_csv(path: str) -> Dict[int, List[float]]:
     """Load a monitor CSV, returning {var_id: [values]}."""
     import csv
     data: Dict[int, List[float]] = defaultdict(list)
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:

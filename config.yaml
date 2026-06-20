@@ -11,44 +11,53 @@
 # ---------------------------------------------------------------------------
 project:
   name: "my_project"
-  root: "."                        # project root (where Makefile/CMakeLists.txt lives)
+  root: ".."                        # from tools/ up to project root
 
 # ---------------------------------------------------------------------------
 # Build & flash
 # ---------------------------------------------------------------------------
 build:
   system: make                     # make | cmake | custom
+  directory: build                 # build output directory
+  parallel: 8                      # make: -j8, cmake: --parallel 8
+  flags: []                        # extra flags (array, no shell expansion)
   target: all                      # build target
   binary: "build/firmware.bin"     # path to flashable binary (elf/bin/hex)
-  flags: "-j$(nproc)"              # extra build flags
   clean_first: false               # run 'clean' before every build
 
 flash:
   backend: openocd                 # openocd | jlink | stlink | dfu | custom
+  verify: true                     # enable INLINE / SEPARATE verify
+  allow_unverified: false          # allow NONE verify mode to proceed
+  allow_no_reset: false            # allow NONE reset mode to proceed
+  boot_timeout_ms: 5000            # max wait for BOOT_DONE frame
   # ---- OpenOCD ----
   openocd:
+    executable: null               # null = auto-detect in PATH
     interface: "interface/stlink-v2.cfg"
     target: "target/stm32f4x.cfg"
-    transport: "hla"               # hla (stlink) | jtag | swd
-    extra_args: "-c 'adapter speed 4000'"
+    address: "0x08000000"          # BIN images require this
+    extra_args: ["-c", "adapter speed 4000"]
   # ---- J-Link ----
   jlink:
+    executable: null
     device: "STM32F407VG"
     interface: "SWD"
     speed: 4000
+    address: "0x08000000"
   # ---- ST-Link (st-flash) ----
-  stlink: {}
+  stlink:
+    executable: null
+    address: "0x08000000"
   # ---- dfu-util ----
   dfu:
+    executable: null
     vid: "0483"
     pid: "df11"
     alt: 0
-  # ---- Verify after flash ----
-  verify: true                     # readback + compare after flashing
-  verify_retries: 3
-  # ---- Boot wait ----
-  boot_timeout_ms: 5000            # max wait for BOOT_DONE frame
-  reset_command: "reset halt"      # OpenOCD command to reset after flash
+  # ---- Custom ----
+  custom:
+    flash_command: []              # only needed when backend=custom
 
 # ---------------------------------------------------------------------------
 # Serial monitor
@@ -83,10 +92,9 @@ monitor:
 # ---------------------------------------------------------------------------
 # Loop control
 # ---------------------------------------------------------------------------
+# UNVERIFIED: convergence_rounds=3 and stall_rounds=5 are placeholder defaults.
+# Tune based on the system's dominant time constant and noise characteristics.
 loop:
-  # UNVERIFIED: convergence_rounds=3 and stall_rounds=5 are placeholder defaults.
-  # Tune based on the system's dominant time constant and noise characteristics.
-  # Fast-responding systems may need only 2 rounds; high-inertia systems may need 10+.
   max_rounds: 20                   # maximum flash→monitor→adjust cycles
   convergence_rounds: 3            # rounds within tolerance to declare success
   stall_rounds: 5                  # rounds without improvement → give up
@@ -103,16 +111,6 @@ safety:
 # ---------------------------------------------------------------------------
 # Monitor variables
 # ---------------------------------------------------------------------------
-# Each variable has:
-#   id:        unique 16-bit ID (matches TRACEPOINT_ID_* in firmware)
-#   name:      human-readable label
-#   type:      int32 | uint32 | float | uint16 | int16
-#   unit:      display unit (no conversion, just for logs)
-#   expected:  {min, max} — the "good" range (success criterion)
-#   warn:      {min, max} — warn if outside this range
-#   emergency: {min, max} — abort loop immediately if outside
-#   window_ms: rolling window for statistics (0 = use monitor.duration_ms)
-#
 variables:
   - id: 0x1001
     name: "motor_rpm"
@@ -149,23 +147,8 @@ variables:
 # ---------------------------------------------------------------------------
 # Adjustable parameters
 # ---------------------------------------------------------------------------
-# Defines what the agent can tune and HOW.
-#   file:       source/header file to edit (relative to project root)
-#   pattern:    regex to locate the line (must capture the numeric value)
-#   type:       macro | kconfig | json | struct_field
-#   format:     "%.2f" etc. — printf format for writing the value back
-#   range:      absolute min/max the parameter may take
-#   default:    factory value (for rollback)
-#   step:       default adjustment step size
-#   auto:       true = agent may change this; false = requires human
-#   depends_on: list of variable IDs that influence this parameter's tuning
-#
-# UNVERIFIED: The depends_on relationship assumes monotonic negative correlation
-# between parameter and variable.  Non-monotonic systems (e.g., PWM freq vs
-# efficiency with resonant peaks) need a per-parameter direction map.
-# UNVERIFIED: step values (0.1, 0.05, 0.01) are arbitrary.  Calibrate based
-# on the system's sensitivity (∂var/∂param).
-#
+# UNVERIFIED: The depends_on relationship assumes monotonic negative correlation.
+# UNVERIFIED: step values (0.1, 0.05, 0.01) are arbitrary.
 parameters:
   - name: "PID_Kp"
     file: "include/pid_config.h"
@@ -208,7 +191,7 @@ parameters:
     range:   { min: 1000, max: 50000 }
     default: 20000
     step:    1000
-    auto:    false               # changing PWM freq may need HW revalidation
+    auto:    false
     depends_on: [0x1001]
 
 # =============================================================================
@@ -223,11 +206,6 @@ extensions:
 # =============================================================================
 # Scenario B example: Stage diagnostics (commented out — uncomment to use)
 # =============================================================================
-# This configuration diagnoses an SD card firmware-burn sequence.
-# Each stage sets its flag variable to 0 on success, 1 on failure.
-# With no auto:true parameters, loop_runner.sh auto-detects Scenario B
-# and runs a single flash→monitor→analyze→report cycle.
-#
 # variables:
 #   - id: 0x2001
 #     name: "stage_bootloader_init"
@@ -236,7 +214,6 @@ extensions:
 #     expected: { min: 0, max: 0 }
 #     warn:     { min: 1, max: 1 }
 #     emergency:{ min: 0, max: 1 }
-#
 #   - id: 0x2002
 #     name: "stage_partition_table"
 #     type: uint16
@@ -244,21 +221,4 @@ extensions:
 #     expected: { min: 0, max: 0 }
 #     warn:     { min: 1, max: 1 }
 #     emergency:{ min: 0, max: 1 }
-#
-#   - id: 0x2003
-#     name: "stage_firmware_write"
-#     type: uint16
-#     unit: "flag"
-#     expected: { min: 0, max: 0 }
-#     warn:     { min: 1, max: 1 }
-#     emergency:{ min: 0, max: 1 }
-#
-#   - id: 0x2004
-#     name: "stage_checksum_verify"
-#     type: uint16
-#     unit: "flag"
-#     expected: { min: 0, max: 0 }
-#     warn:     { min: 1, max: 1 }
-#     emergency:{ min: 0, max: 1 }
-#
 # parameters: []   # no auto-tune params → Scenario B automatically
